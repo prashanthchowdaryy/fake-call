@@ -4,6 +4,12 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>Ringer</title>
+<link rel="manifest" href="manifest.json">
+<meta name="theme-color" content="#0b0d0e">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<link rel="apple-touch-icon" href="icon-192.png">
 <style>
   :root{
     --bg:#FAFAF8;
@@ -644,6 +650,73 @@
 
   let countdownInterval, incallInterval, vibrateInterval, ringAudioCtx, ringStopFn;
 
+  /* ---------------- PWA install + fullscreen ---------------- */
+  if('serviceWorker' in navigator){
+    navigator.serviceWorker.register('sw.js').catch(()=>{});
+    navigator.serviceWorker.addEventListener('message', e=>{
+      if(e.data && e.data.type==='RINGER_CATCHUP') checkDueCall();
+    });
+  }
+  function goFullscreen(){
+    const inStandalone = window.matchMedia('(display-mode: standalone)').matches ||
+                          window.matchMedia('(display-mode: fullscreen)').matches ||
+                          window.navigator.standalone === true;
+    if(inStandalone) return; // already chrome-free, nothing to do
+    const el = document.documentElement;
+    if(el.requestFullscreen) el.requestFullscreen().catch(()=>{});
+    else if(el.webkitRequestFullscreen) el.webkitRequestFullscreen();
+  }
+
+  /* ---------------- durable scheduling (survives backgrounding) ---------------- */
+  const DUE_KEY='ringerDueAt', PAYLOAD_KEY='ringerPayload';
+
+  function persistSchedule(dueAt){
+    try{
+      localStorage.setItem(DUE_KEY, String(dueAt));
+      localStorage.setItem(PAYLOAD_KEY, JSON.stringify(scheduled));
+    }catch(e){}
+  }
+  function clearSchedule(){
+    try{ localStorage.removeItem(DUE_KEY); localStorage.removeItem(PAYLOAD_KEY); }catch(e){}
+  }
+  function checkDueCall(){
+    let dueAt;
+    try{ dueAt = parseInt(localStorage.getItem(DUE_KEY),10); }catch(e){ return; }
+    if(!dueAt || isNaN(dueAt)) return;
+    if(Date.now() >= dueAt){
+      try{ scheduled = JSON.parse(localStorage.getItem(PAYLOAD_KEY)) || scheduled; }catch(e){}
+      clearInterval(countdownInterval);
+      $('countdownOverlay').classList.remove('active');
+      clearSchedule();
+      triggerIncoming();
+    }
+  }
+  document.addEventListener('visibilitychange', ()=>{ if(!document.hidden) checkDueCall(); });
+  window.addEventListener('focus', checkDueCall);
+  window.addEventListener('pageshow', checkDueCall);
+  checkDueCall();
+
+  let notifyPermissionAsked=false;
+  async function ensureNotifyPermission(){
+    if(!('Notification' in window) || notifyPermissionAsked) return;
+    notifyPermissionAsked=true;
+    if(Notification.permission==='default'){ try{ await Notification.requestPermission(); }catch(e){} }
+  }
+  async function scheduleWakeNotification(delaySec, name){
+    if(!('serviceWorker' in navigator) || Notification.permission!=='granted') return;
+    try{
+      const reg = await navigator.serviceWorker.ready;
+      setTimeout(()=>{
+        reg.showNotification(`${name} is calling…`, {
+          body:'Tap to answer',
+          tag:'ringer-call',
+          requireInteraction:true,
+          silent:false
+        });
+      }, Math.max(0, delaySec*1000 - 300));
+    }catch(e){}
+  }
+
   /* ---------------- chips / toggles ---------------- */
   $('delayChips').querySelectorAll('.chip').forEach(chip=>{
     chip.addEventListener('click', ()=>{
@@ -768,6 +841,9 @@
     if(!scheduled.name){ scheduled.name = 'Unknown'; }
     scheduled.msgText = $('msgText').value.trim() || 'Call me back when you can!';
 
+    goFullscreen();
+    await ensureNotifyPermission();
+
     setAvatarEl($('cdAvatar'), scheduled.name, scheduled.photoDataUrl);
     $('cdName').textContent = scheduled.name;
 
@@ -775,16 +851,21 @@
     $('cdTimer').textContent = fmt(remaining);
     $('countdownOverlay').classList.add('active');
 
+    const dueAt = Date.now() + remaining*1000;
+    persistSchedule(dueAt);
+    scheduleWakeNotification(remaining, scheduled.name);
+
     countdownInterval = setInterval(()=>{
-      remaining--;
+      remaining = Math.round((dueAt - Date.now())/1000);
       if(remaining<=0){
         clearInterval(countdownInterval);
         $('countdownOverlay').classList.remove('active');
+        clearSchedule();
         triggerIncoming();
       } else { $('cdTimer').textContent = fmt(remaining); }
     },1000);
   });
-  function cancelCountdown(){ clearInterval(countdownInterval); $('countdownOverlay').classList.remove('active'); }
+  function cancelCountdown(){ clearInterval(countdownInterval); $('countdownOverlay').classList.remove('active'); clearSchedule(); }
   $('cancelBtn').addEventListener('click', cancelCountdown);
   $('cancelFromCountdown').addEventListener('click', cancelCountdown);
 
@@ -822,7 +903,15 @@
   function stopVibrate(){ if(vibrateInterval) clearInterval(vibrateInterval); if(navigator.vibrate) navigator.vibrate(0); }
 
   /* ---------------- incoming / in-call ---------------- */
+  function clearWakeNotification(){
+    if('serviceWorker' in navigator){
+      navigator.serviceWorker.ready.then(reg=>{
+        reg.getNotifications({tag:'ringer-call'}).then(list=> list.forEach(n=>n.close()));
+      }).catch(()=>{});
+    }
+  }
   async function triggerIncoming(){
+    clearWakeNotification();
     setAvatarEl($('icAvatar'), scheduled.name, scheduled.photoDataUrl);
     setCallBg('incomingBg', scheduled.name, scheduled.photoDataUrl);
     $('icName').textContent = scheduled.name;
